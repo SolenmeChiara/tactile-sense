@@ -338,18 +338,19 @@ def _make_stroke_memory_callback(target_user_id: str):
             from src.plugins.built_in.kokoro_flow_chatter.models import EventType as KFCEventType, MentalLogEntry
             from src.plugins.built_in.kokoro_flow_chatter.session import get_session_manager
 
-            # 仿生睡眠适配：触摸 = 物理刺激，增加清醒度
-            sleep_mgr = _get_sleep_manager()
-            if sleep_mgr is not None:
-                try:
-                    session_id = f"private_{target_user_id}"
-                    new_val, just_woken = sleep_mgr.add_wake_value(session_id)
-                    if just_woken:
-                        logger.info(f"[TactileSleep] 触觉唤醒了小克! 清醒度={new_val:.1f} (超过阈值)")
-                    else:
-                        logger.debug(f"[TactileSleep] 清醒度 +increment → {new_val:.1f}")
-                except Exception as e:
-                    logger.debug(f"[TactileSleep] add_wake_value 异常: {e}")
+            # 仿生睡眠适配：仅在睡眠时增加清醒度（清醒时段清醒值无意义）
+            if _is_sleeping():
+                sleep_mgr = _get_sleep_manager()
+                if sleep_mgr is not None:
+                    try:
+                        session_id = f"private_{target_user_id}"
+                        new_val, just_woken = sleep_mgr.add_wake_value(session_id)
+                        if just_woken:
+                            logger.info(f"[TactileSleep] 触觉唤醒了小克! 清醒度={new_val:.1f} (超过阈值)")
+                        else:
+                            logger.debug(f"[TactileSleep] 清醒度 +increment → {new_val:.1f}")
+                    except Exception as e:
+                        logger.debug(f"[TactileSleep] add_wake_value 异常: {e}")
 
             # 写入 KFC mental_log
             stream_id = ChatManager.get_stream_id(platform="qq", id=target_user_id, is_group=False)
