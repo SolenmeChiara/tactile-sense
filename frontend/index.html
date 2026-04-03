@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tactile Sense</title>
+<style>
+  /* ======= Light / Dark tokens ======= */
+  :root {
+    --bg: #f5f5f5;
+    --surface: #ffffff;
+    --border: #d4d4d4;
+    --text: #171717;
+    --muted: #737373;
+    --faint: #a3a3a3;
+    --grid: rgba(0,0,0,0.04);
+    --grid-accent: rgba(0,0,0,0.08);
+    --trail: rgba(0,0,0,0.35);
+    --trail-cal: rgba(0,0,0,0.15);
+    --log-bg: #fafafa;
+    --log-ok: #166534;
+    --log-err: #991b1b;
+    --log-info: #1e40af;
+    --dot-active: #16a34a;
+    --dot-cal: #2563eb;
+    --dot-awake: #dc2626;
+    --summary-bg: rgba(0,0,0,0.03);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0a0a0a;
+      --surface: #141414;
+      --border: #2e2e2e;
+      --text: #e5e5e5;
+      --muted: #a3a3a3;
+      --faint: #525252;
+      --grid: rgba(255,255,255,0.03);
+      --grid-accent: rgba(255,255,255,0.06);
+      --trail: rgba(255,255,255,0.4);
+      --trail-cal: rgba(255,255,255,0.15);
+      --log-bg: #111111;
+      --log-ok: #86efac;
+      --log-err: #fca5a5;
+      --log-info: #93c5fd;
+      --dot-active: #4ade80;
+      --dot-cal: #60a5fa;
+      --dot-awake: #ef4444;
+      --summary-bg: rgba(255,255,255,0.03);
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  header h1 {
+    font-size: 1.1em;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  header .subtitle {
+    font-size: 0.75em;
+    color: var(--faint);
+    font-weight: 400;
+  }
+
+  #status-bar {
+    display: flex;
+    gap: 18px;
+    margin-bottom: 14px;
+    font-size: 0.8em;
+    color: var(--muted);
+  }
+  #status-bar .indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--faint);
+    flex-shrink: 0;
+  }
+  .dot.active { background: var(--dot-active); }
+  .dot.calibrating { background: var(--dot-cal); animation: pulse 1s infinite; }
+  .dot.awake { background: var(--dot-awake); animation: pulse 0.8s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  #canvas-container {
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+    cursor: crosshair;
+  }
+
+  #overlay-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 0.95em;
+    color: var(--faint);
+    pointer-events: none;
+    text-align: center;
+    transition: opacity 0.4s;
+    line-height: 1.6;
+  }
+  #overlay-text.hidden { opacity: 0; }
+  #overlay-text small { font-size: 0.8em; }
+
+  #recent-touches {
+    margin-top: 14px;
+    width: 100%;
+    max-width: 620px;
+    font-size: 0.8em;
+  }
+  #recent-touches h3 {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 0.85em;
+    margin-bottom: 5px;
+  }
+  .touch-summary {
+    padding: 3px 8px;
+    margin-bottom: 2px;
+    background: var(--summary-bg);
+    border-radius: 3px;
+    color: var(--muted);
+    font-family: "Cascadia Code", "Consolas", "SF Mono", monospace;
+    font-size: 0.92em;
+  }
+
+  #log {
+    margin-top: 14px;
+    width: 100%;
+    max-width: 620px;
+    max-height: 180px;
+    overflow-y: auto;
+    font-family: "Cascadia Code", "Consolas", "SF Mono", monospace;
+    font-size: 0.72em;
+    color: var(--muted);
+    background: var(--log-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+  }
+  #log .entry { margin-bottom: 3px; line-height: 1.4; }
+  #log .entry.accepted { color: var(--log-ok); }
+  #log .entry.rejected { color: var(--log-err); }
+  #log .entry.info { color: var(--log-info); }
+
+  /* Session takeover banner */
+  #takeover-banner {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    background: var(--dot-awake);
+    color: #fff;
+    text-align: center;
+    padding: 10px;
+    font-size: 0.85em;
+    font-weight: 500;
+    z-index: 999;
+  }
+  #takeover-banner.show { display: block; }
+</style>
+</head>
+<body>
+
+<div id="takeover-banner">此会话已被新窗口接管，触觉输入已停止。</div>
+
+<header>
+  <h1>Tactile Sense</h1>
+  <span class="subtitle">v0.1</span>
+</header>
+
+<div id="status-bar">
+  <span class="indicator">
+    <span id="dot-connection" class="dot"></span>
+    <span id="label-connection">--</span>
+  </span>
+  <span class="indicator">
+    <span id="dot-calibration" class="dot"></span>
+    <span id="label-calibration">--</span>
+  </span>
+  <span class="indicator">
+    <span id="dot-state" class="dot"></span>
+    <span id="label-state">--</span>
+  </span>
+  <span class="indicator">
+    strokes: <span id="stroke-count">0</span>
+  </span>
+</div>
+
+<div id="canvas-container">
+  <canvas id="touch-canvas" width="600" height="400"></canvas>
+  <div id="overlay-text">用笔尖触碰这里<br><small>仅响应数位板笔输入</small></div>
+</div>
+
+<div id="recent-touches">
+  <h3>recent</h3>
+  <div id="touch-list"></div>
+</div>
+
+<div id="log"></div>
+
+<script>
+// ===========================================================================
+// Session exclusivity — BroadcastChannel
+// ===========================================================================
+const SESSION_CHANNEL = "tactile_sense_session";
+const bc = new BroadcastChannel(SESSION_CHANNEL);
+let sessionActive = true;
+
+bc.addEventListener("message", (e) => {
+  if (e.data === "takeover") {
+    // Another tab is taking over
+    sessionActive = false;
+    document.getElementById("takeover-banner").classList.add("show");
+    canvas.style.pointerEvents = "none";
+    addLog("会话已被新窗口接管", "rejected");
+  }
+});
+
+// Announce takeover on load
+bc.postMessage("takeover");
+
+// ===========================================================================
+// Config
+// ===========================================================================
+const API_BASE = window.location.pathname.replace(/\/$/, "");
+const DOWNSAMPLE_INTERVAL_MS = 16;
+const CALIBRATION_DURATION_MS = 10000;
+const TRAIL_FADE_MS = 2000;
+
+// ===========================================================================
+// State
+// ===========================================================================
+const canvas = document.getElementById("touch-canvas");
+const ctx = canvas.getContext("2d");
+const overlay = document.getElementById("overlay-text");
+const logEl = document.getElementById("log");
+const touchListEl = document.getElementById("touch-list");
+
+let strokeCounter = 0;
+let totalStrokes = 0;
+let sessionStart = Date.now();
+
+let calibrating = false;
+let calibrated = false;
+let calibrationSamples = [];
+let calibrationParams = { p25: 0, p50: 0.5, p75: 1.0 };
+
+let currentStroke = null;
+let lastSampleTime = 0;
+let trails = [];
+
+// Detect color scheme for canvas drawing
+const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+// ===========================================================================
+// Calibration
+// ===========================================================================
+function startCalibration() {
+  calibrating = true;
+  calibrationSamples = [];
+  setStatus("calibration", "calibrating", "calibrating...");
+  overlay.textContent = "随便摸摸，让我熟悉你的手感\n（10秒校准期）";
+  overlay.classList.remove("hidden");
+  addLog("开始校准", "info");
+  setTimeout(() => finishCalibration(), CALIBRATION_DURATION_MS);
+}
+
+function finishCalibration() {
+  calibrating = false;
+  if (calibrationSamples.length < 5) {
+    addLog("校准样本不足，使用默认参数", "info");
+    calibrated = true;
+    setStatus("calibration", "active", "calibrated (default)");
+    overlay.classList.add("hidden");
+    return;
+  }
+  calibrationSamples.sort((a, b) => a - b);
+  const len = calibrationSamples.length;
+  calibrationParams.p25 = calibrationSamples[Math.floor(len * 0.25)];
+  calibrationParams.p50 = calibrationSamples[Math.floor(len * 0.5)];
+  calibrationParams.p75 = calibrationSamples[Math.floor(len * 0.75)];
+  sessionStorage.setItem("tactile_calibration", JSON.stringify(calibrationParams));
+  calibrated = true;
+  setStatus("calibration", "active", `p25=${calibrationParams.p25.toFixed(2)}`);
+  overlay.classList.add("hidden");
+  addLog(`校准完成: p25=${calibrationParams.p25.toFixed(3)} p75=${calibrationParams.p75.toFixed(3)}`, "info");
+  fetch(`${API_BASE}/calibration`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(calibrationParams),
+  }).catch(() => {});
+}
+
+function normalizePressure(raw) {
+  if (!calibrated) return raw;
+  const { p25, p75 } = calibrationParams;
+  if (p75 - p25 < 0.001) return raw;
+  return Math.max(0, Math.min(1, (raw - p25) / (p75 - p25)));
+}
+
+// ===========================================================================
+// Stroke
+// ===========================================================================
+function beginStroke(e) {
+  if (!sessionActive) return;
+  strokeCounter++;
+  currentStroke = {
+    id: `s_${sessionStart}_${String(strokeCounter).padStart(4, "0")}`,
+    samples: [],
+    startTime: Date.now(),
+  };
+  addSample(e);
+}
+
+function addSample(e) {
+  if (!currentStroke) return;
+  const now = Date.now();
+  if (now - lastSampleTime < DOWNSAMPLE_INTERVAL_MS) return;
+  lastSampleTime = now;
+  const rawP = e.pressure;
+  if (calibrating) calibrationSamples.push(rawP);
+  const sample = {
+    t: now, x: e.offsetX, y: e.offsetY,
+    pressure: normalizePressure(rawP), rawPressure: rawP,
+    tiltX: e.tiltX || 0, tiltY: e.tiltY || 0, twist: e.twist || 0,
+  };
+  currentStroke.samples.push(sample);
+  addTrailPoint(sample.x, sample.y, sample.pressure, calibrating);
+}
+
+function finalizeStroke(opts = {}) {
+  if (!currentStroke || currentStroke.samples.length === 0) { currentStroke = null; return; }
+  const samples = currentStroke.samples;
+  const truncated = opts.truncated || false;
+
+  const duration_ms = samples[samples.length - 1].t - samples[0].t;
+  const start = { x: samples[0].x, y: samples[0].y };
+  const end = { x: samples[samples.length - 1].x, y: samples[samples.length - 1].y };
+
+  let totalDistance = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const dx = samples[i].x - samples[i-1].x, dy = samples[i].y - samples[i-1].y;
+    totalDistance += Math.sqrt(dx*dx + dy*dy);
+  }
+  const displacement = Math.sqrt((end.x-start.x)**2 + (end.y-start.y)**2);
+  const curvature = totalDistance > 0 ? displacement / totalDistance : 0;
+
+  const pressures = samples.map(s => s.pressure).sort((a,b) => a-b);
+  const pLen = pressures.length;
+  const pressure_min = pressures[0], pressure_max = pressures[pLen-1];
+  const pressure_mean = pressures.reduce((a,b)=>a+b,0)/pLen;
+  const pressure_p75 = pressures[Math.floor(pLen*0.75)];
+
+  const curveLen = Math.min(20, samples.length);
+  const pressure_curve = [];
+  for (let i = 0; i < curveLen; i++) {
+    const idx = Math.floor(i*(samples.length-1)/Math.max(curveLen-1,1));
+    pressure_curve.push(+(samples[idx].pressure.toFixed(3)));
+  }
+
+  const velocities = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = (samples[i].t - samples[i-1].t)/1000;
+    if (dt <= 0) continue;
+    const dx = samples[i].x-samples[i-1].x, dy = samples[i].y-samples[i-1].y;
+    velocities.push(Math.sqrt(dx*dx+dy*dy)/dt);
+  }
+  const velocity_mean = velocities.length > 0 ? velocities.reduce((a,b)=>a+b,0)/velocities.length/1000 : 0;
+  const velocity_max = velocities.length > 0 ? Math.max(...velocities)/1000 : 0;
+
+  const tilt_mean_x = samples.reduce((a,s)=>a+s.tiltX,0)/samples.length;
+  const tilt_mean_y = samples.reduce((a,s)=>a+s.tiltY,0)/samples.length;
+
+  const xs = samples.map(s=>s.x), ys = samples.map(s=>s.y);
+  const bbox = { x:Math.min(...xs), y:Math.min(...ys), w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys) };
+  const bboxDiag = Math.sqrt(bbox.w**2+bbox.h**2);
+
+  let directionReversals = 0;
+  for (let i = 2; i < samples.length; i++) {
+    const dx1=samples[i-1].x-samples[i-2].x, dy1=samples[i-1].y-samples[i-2].y;
+    const dx2=samples[i].x-samples[i-1].x, dy2=samples[i].y-samples[i-1].y;
+    if (dx1*dx2+dy1*dy2 < 0) directionReversals++;
+  }
+  const vMean = velocities.length>0 ? velocities.reduce((a,b)=>a+b,0)/velocities.length : 0;
+  const vVariance = velocities.length>1 ? velocities.reduce((a,v)=>a+(v-vMean)**2,0)/velocities.length : 0;
+
+  // Gesture classification
+  let gesture_hint;
+  if (truncated) {
+    gesture_hint = "interrupted";
+  } else if (duration_ms < 150 && displacement < 10) {
+    gesture_hint = "tap";
+  } else if (duration_ms < 200 && displacement > 15) {
+    gesture_hint = "flick";
+  } else if (duration_ms > 500 && displacement < 15 && pressure_mean > 0.4) {
+    gesture_hint = "press_and_hold";
+  } else if (directionReversals >= 3 && directionReversals <= 6 && bboxDiag > 0 && totalDistance/bboxDiag > 3 && pressure_mean > 0.4) {
+    gesture_hint = "scratch";
+  } else if (directionReversals >= 3 && directionReversals <= 6 && bboxDiag > 0 && totalDistance/bboxDiag > 2.5) {
+    gesture_hint = "rub";
+  } else if (curvature < 0.3 && displacement < bboxDiag*0.4 && totalDistance > 30) {
+    gesture_hint = "circle";
+  } else if (vVariance > 5000 && directionReversals > 6) {
+    gesture_hint = "scribble";
+  } else if (pressure_mean > 0.5 && velocity_mean*1000 < 120 && totalDistance > 40) {
+    gesture_hint = "press_drag";
+  } else if (velocity_mean*1000 < 150 && duration_ms > 800 && totalDistance > 50) {
+    gesture_hint = "slow_trace";
+  } else if (curvature > 0.7 && velocity_mean*1000 > 300) {
+    gesture_hint = "stroke";
+  } else {
+    gesture_hint = "stroke";
+  }
+
+  const strokeObj = {
+    stroke_id: currentStroke.id, truncated, duration_ms,
+    sample_count: samples.length, start, end, bounding_box: bbox,
+    total_distance: +totalDistance.toFixed(1),
+    displacement: +displacement.toFixed(1),
+    curvature_ratio: +curvature.toFixed(3),
+    pressure_min: +pressure_min.toFixed(3),
+    pressure_max: +pressure_max.toFixed(3),
+    pressure_mean: +pressure_mean.toFixed(3),
+    pressure_p75: +pressure_p75.toFixed(3),
+    pressure_curve,
+    velocity_mean: +velocity_mean.toFixed(4),
+    velocity_max: +velocity_max.toFixed(4),
+    tilt_mean_x: +tilt_mean_x.toFixed(1),
+    tilt_mean_y: +tilt_mean_y.toFixed(1),
+    gesture_hint,
+    canvas_width: canvas.width, canvas_height: canvas.height,
+  };
+
+  currentStroke = null;
+  totalStrokes++;
+  document.getElementById("stroke-count").textContent = totalStrokes;
+
+  if (calibrating) {
+    addLog(`[cal] ${gesture_hint} | p=${pressure_mean.toFixed(2)} | ${duration_ms}ms`, "info");
+    return;
+  }
+  sendStroke(strokeObj);
+}
+
+async function sendStroke(strokeObj) {
+  try {
+    const resp = await fetch(`${API_BASE}/stroke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(strokeObj),
+    });
+    const result = await resp.json();
+    if (result.accepted) {
+      addLog(
+        `${result.gesture} @ ${result.region} | w=${result.wakeup_score} n=${result.novelty} | ${result.state}`,
+        "accepted"
+      );
+      updateState(result.state);
+      refreshTouchList();
+    } else {
+      addLog(`filtered: ${result.reason || "invalid"}`, "rejected");
+    }
+  } catch (err) {
+    addLog(`send failed: ${err.message}`, "rejected");
+    setStatus("connection", "", "disconnected");
+  }
+}
+
+// ===========================================================================
+// Trail rendering
+// ===========================================================================
+function addTrailPoint(x, y, pressure, isCalibration) {
+  if (trails.length === 0 || !trails[trails.length-1].active) {
+    trails.push({ points: [], active: true, isCalibration });
+  }
+  trails[trails.length-1].points.push({ x, y, p: pressure, t: Date.now() });
+}
+function endCurrentTrail() {
+  if (trails.length > 0 && trails[trails.length-1].active) trails[trails.length-1].active = false;
+}
+
+function renderTrails() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  ctx.strokeStyle = "var(--grid)";
+  ctx.lineWidth = 1;
+  for (let x = 0; x < canvas.width; x += 60) {
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y < canvas.height; y += 60) {
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+  }
+
+  // 3x3 dividers
+  const gridColor = isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
+  ctx.strokeStyle = gridColor;
+  ctx.setLineDash([3,3]);
+  const w3 = canvas.width/3, h3 = canvas.height/3;
+  for (let i = 1; i <= 2; i++) {
+    ctx.beginPath(); ctx.moveTo(w3*i,0); ctx.lineTo(w3*i,canvas.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,h3*i); ctx.lineTo(canvas.width,h3*i); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  const now = Date.now();
+  const expired = [];
+
+  for (let i = 0; i < trails.length; i++) {
+    const trail = trails[i];
+    if (trail.points.length < 2) continue;
+    const age = now - trail.points[trail.points.length-1].t;
+    if (!trail.active && age > TRAIL_FADE_MS) { expired.push(i); continue; }
+
+    for (let j = 1; j < trail.points.length; j++) {
+      const p0 = trail.points[j-1], p1 = trail.points[j];
+      const ptAge = now - p1.t;
+      const fade = trail.active ? 1 : Math.max(0, 1 - ptAge/TRAIL_FADE_MS);
+      if (fade <= 0) continue;
+
+      const baseAlpha = p1.p * 0.5 * fade;
+      const color = trail.isCalibration
+        ? (isDark ? `rgba(255,255,255,${baseAlpha*0.4})` : `rgba(0,0,0,${baseAlpha*0.3})`)
+        : (isDark ? `rgba(255,255,255,${baseAlpha})` : `rgba(0,0,0,${baseAlpha})`);
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1 + p1.p * 3;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+    }
+  }
+
+  for (let i = expired.length-1; i >= 0; i--) trails.splice(expired[i], 1);
+  requestAnimationFrame(renderTrails);
+}
+
+// ===========================================================================
+// Pointer Events
+// ===========================================================================
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.pointerType !== "pen" || !sessionActive) return;
+  e.preventDefault();
+  overlay.classList.add("hidden");
+  if (!calibrated && !calibrating) startCalibration();
+  beginStroke(e);
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (e.pointerType !== "pen" || !currentStroke) return;
+  e.preventDefault();
+  addSample(e);
+});
+canvas.addEventListener("pointerup", (e) => {
+  if (e.pointerType !== "pen") return;
+  e.preventDefault(); endCurrentTrail(); finalizeStroke();
+});
+canvas.addEventListener("pointerleave", (e) => {
+  if (e.pointerType !== "pen" || !currentStroke) return;
+  endCurrentTrail(); finalizeStroke();
+});
+canvas.addEventListener("pointercancel", (e) => {
+  if (e.pointerType !== "pen") return;
+  endCurrentTrail(); finalizeStroke({ truncated: true });
+});
+
+// ===========================================================================
+// UI
+// ===========================================================================
+function setStatus(type, state, label) {
+  document.getElementById(`dot-${type}`).className = "dot" + (state ? ` ${state}` : "");
+  document.getElementById(`label-${type}`).textContent = label;
+}
+function updateState(state) {
+  setStatus("state", state === "awake" ? "awake" : "", state === "awake" ? "awake" : "silent");
+}
+function addLog(msg, cls = "") {
+  const entry = document.createElement("div");
+  entry.className = `entry ${cls}`;
+  entry.textContent = `[${new Date().toLocaleTimeString("en-GB",{hour12:false})}] ${msg}`;
+  logEl.prepend(entry);
+  while (logEl.children.length > 50) logEl.removeChild(logEl.lastChild);
+}
+async function refreshTouchList() {
+  try {
+    const data = await (await fetch(`${API_BASE}/status`)).json();
+    touchListEl.innerHTML = "";
+    for (const entry of data.entries) {
+      const div = document.createElement("div");
+      div.className = "touch-summary";
+      div.textContent = entry.summary;
+      touchListEl.appendChild(div);
+    }
+  } catch {}
+}
+
+// ===========================================================================
+// Init
+// ===========================================================================
+(async function init() {
+  const saved = sessionStorage.getItem("tactile_calibration");
+  if (saved) {
+    try {
+      calibrationParams = JSON.parse(saved);
+      calibrated = true;
+      setStatus("calibration", "active", `p25=${calibrationParams.p25.toFixed(2)}`);
+      overlay.textContent = "用笔尖触碰这里";
+      addLog("restored calibration from session", "info");
+    } catch {}
+  }
+
+  try {
+    const resp = await fetch(`${API_BASE}/status`);
+    if (resp.ok) {
+      setStatus("connection", "active", "connected");
+      addLog("backend connected", "info");
+      refreshTouchList();
+    }
+  } catch {
+    setStatus("connection", "", "disconnected");
+    addLog("backend unreachable", "rejected");
+  }
+
+  setStatus("state", "", "silent");
+  requestAnimationFrame(renderTrails);
+})();
+</script>
+</body>
+</html>

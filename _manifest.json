@@ -1,0 +1,28 @@
+{
+  "manifest_version": 1,
+  "name": "触觉感知系统 (Tactile Sense)",
+  "version": "0.1.0",
+  "description": "通过数位板为小克提供触觉感知能力。网页前端捕获笔触信号，后端解析为触觉体验并注入认知循环。仅限本地部署者使用。",
+  "author": "sol",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "functional",
+    "components": [
+      {
+        "type": "router",
+        "name": "tactile_router",
+        "description": "提供触觉数据接收端点和前端页面服务"
+      },
+      {
+        "type": "prompt",
+        "name": "tactile_context_prompt",
+        "description": "将最近的触觉感知摘要注入 replyer/planner 的系统提示"
+      },
+      {
+        "type": "event_handler",
+        "name": "tactile_startup_handler",
+        "description": "插件启动时初始化触觉引擎"
+      }
+    ]
+  }
+}
