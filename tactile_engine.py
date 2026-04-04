@@ -321,6 +321,10 @@ class TactileEngine:
         self._on_stroke_callback: Any | None = None  # 每次有效 stroke 被接受时
         # 已读追踪：planner/replyer 消费过的最后一个 stroke_id
         self._last_read_stroke_id: str = ""
+        # 触摸积累降阈值
+        self._t_high_base: float = self.t_high  # 配置原值，唤醒后恢复到这里
+        self.touch_threshold_drop: float = 0.05  # 每次有效触摸未唤醒时 t_high 降多少
+        self.touch_threshold_floor: float = 0.20  # t_high 最低不低于此值
         # 锁
         self._lock = asyncio.Lock()
 
@@ -400,6 +404,8 @@ class TactileEngine:
                     f"[TactileEngine] *** 状态切换: 静默 → 唤醒 *** | "
                     f"score={score} >= t_high={self.t_high}"
                 )
+                # 唤醒后重置阈值到配置原值
+                self._reset_threshold()
                 # 主动触发回调
                 if self._on_wakeup_callback is not None:
                     try:
@@ -414,6 +420,12 @@ class TactileEngine:
                     f"[TactileEngine] 状态切换: 唤醒 → 静默 | "
                     f"score={score} <= t_low={self.t_low}"
                 )
+            elif not self._awake and score < self.t_high and not in_cooldown:
+                # 未达阈值 → 自动降低 t_high，积累触摸最终触发
+                old_t = self.t_high
+                self.t_high = max(self.t_high - self.touch_threshold_drop, self.touch_threshold_floor)
+                if self.t_high != old_t:
+                    logger.debug(f"[TactileEngine] 触摸未达阈值，t_high 下降: {old_t:.2f} → {self.t_high:.2f}")
             elif not self._awake and score >= self.t_high and in_cooldown:
                 logger.debug(f"[TactileEngine] 唤醒被冷却期阻止 (剩余 {self.cooldown_seconds - (now - self._last_wakeup_time):.1f}s)")
             elif not self._awake and score >= self.t_high and self._text_lock:
@@ -439,10 +451,7 @@ class TactileEngine:
                     "text_gap": factors.text_gap,
                 },
             }
-            if state_changed:
-                logger.info(f"[TactileEngine] 全链路追踪: {log_entry}")
-            else:
-                logger.debug(f"[TactileEngine] 全链路追踪: {log_entry}")
+            logger.debug(f"[TactileEngine] 全链路追踪: {log_entry}")
 
             logger.debug(
                 f"[TactileEngine] stroke {features.stroke_id} 处理完成 | "
@@ -525,6 +534,12 @@ class TactileEngine:
         """注册唤醒回调。callback 签名: async def(score, factors, summaries)"""
         self._on_wakeup_callback = callback
         logger.info("[TactileEngine] 唤醒回调已注册")
+
+    def _reset_threshold(self) -> None:
+        """唤醒触发后重置 t_high 到配置原值"""
+        if self.t_high != self._t_high_base:
+            logger.debug(f"[TactileEngine] 唤醒后重置阈值: {self.t_high:.2f} → {self._t_high_base:.2f}")
+            self.t_high = self._t_high_base
 
     def set_stroke_callback(self, callback) -> None:
         """注册 stroke 回调。callback 签名: async def(features, summary, score, novelty)"""

@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
-from src.common.logger import get_logger
+from src.common.logger import get_logger, _register_logger_meta
 from src.plugin_system.base.base_http_component import BaseRouterComponent
 from src.plugin_system.base.base_plugin import BasePlugin
 from src.plugin_system.base.base_prompt import BasePrompt
@@ -20,6 +20,11 @@ from src.plugin_system.base.component_types import (
 )
 from src.plugin_system.base.config_types import ConfigField
 from src.plugin_system.apis.plugin_register_api import register_plugin
+
+# 注册日志颜色 — 绿色系
+_register_logger_meta("tactile_sense", color="#8A9A5B")    # 橄榄绿 — 主插件
+_register_logger_meta("tactile_engine", color="#568203")   # 鲜草绿 — 引擎核心
+_register_logger_meta("tactile_summary", color="#A9BA9D")  # 灰绿 — 摘要生成
 
 logger = get_logger("tactile_sense")
 
@@ -94,7 +99,7 @@ class TactileRouter(BaseRouterComponent):
         async def receive_calibration(request: Request):
             """接收前端校准完成后的参数"""
             data = await request.json()
-            logger.info(f"[TactileRouter] 收到校准参数: p25={data.get('p25')}, p50={data.get('p50')}, p75={data.get('p75')}")
+            logger.debug(f"[TactileRouter] 收到校准参数: p25={data.get('p25')}, p50={data.get('p50')}, p75={data.get('p75')}")
             return {"status": "ok", "message": "校准参数已记录"}
 
 
@@ -143,7 +148,7 @@ class TactileContextPrompt(BasePrompt):
             return ""
 
         target = self.target_prompt_name or "prompt"
-        logger.info(f"[TactilePrompt] 注入 {len(summaries)} 条触觉摘要到 {target}")
+        logger.debug(f"[TactilePrompt] 注入 {len(summaries)} 条触觉摘要到 {target}")
 
         lines = "\n".join(summaries)
 
@@ -228,6 +233,7 @@ class TactileStartupHandler(BaseEventHandler):
         engine = TactileEngine()
         if self.plugin_config:
             engine.t_high = self.get_config("wakeup.t_high", engine.t_high)
+            engine._t_high_base = engine.t_high  # 保存配置原值，唤醒后恢复到这里
             engine.t_low = self.get_config("wakeup.t_low", engine.t_low)
             engine.cooldown_seconds = self.get_config("wakeup.cooldown_seconds", engine.cooldown_seconds)
             engine.canvas_width = float(self.get_config("canvas.default_width", engine.canvas_width))
@@ -318,7 +324,9 @@ def _is_sleeping() -> bool:
         return False
     try:
         state = manager.get_current_state()
-        return str(state) == "sleeping"
+        # SleepState 枚举值为大写: "AWAKE", "DROWSY", "SLEEPING"
+        state_str = state.value if hasattr(state, "value") else str(state)
+        return state_str.upper() == "SLEEPING"
     except Exception:
         return False
 
@@ -338,17 +346,19 @@ def _make_stroke_memory_callback(target_user_id: str):
             from src.plugins.built_in.kokoro_flow_chatter.models import EventType as KFCEventType, MentalLogEntry
             from src.plugins.built_in.kokoro_flow_chatter.session import get_session_manager
 
-            # 仿生睡眠适配：仅在睡眠时增加清醒度（清醒时段清醒值无意义）
+            # 仿生睡眠适配：仅在睡眠且尚未醒时增加清醒度
             if _is_sleeping():
                 sleep_mgr = _get_sleep_manager()
                 if sleep_mgr is not None:
                     try:
                         session_id = f"private_{target_user_id}"
-                        new_val, just_woken = sleep_mgr.add_wake_value(session_id)
-                        if just_woken:
-                            logger.info(f"[TactileSleep] 触觉唤醒了小克! 清醒度={new_val:.1f} (超过阈值)")
-                        else:
-                            logger.debug(f"[TactileSleep] 清醒度 +increment → {new_val:.1f}")
+                        # 已经过阈值就不再重复调，避免刷屏
+                        if not sleep_mgr.is_woken(session_id):
+                            new_val, just_woken = sleep_mgr.add_wake_value(session_id)
+                            if just_woken:
+                                logger.info(f"[TactileSleep] 触觉唤醒了小克! 清醒度={new_val:.1f} (超过阈值)")
+                            else:
+                                logger.debug(f"[TactileSleep] 清醒度 +increment → {new_val:.1f}")
                     except Exception as e:
                         logger.debug(f"[TactileSleep] add_wake_value 异常: {e}")
 
@@ -408,10 +418,22 @@ def _make_wakeup_callback(target_user_id: str):
                 f"[TactileActive] 触觉唤醒触发! score={score:.3f} → 目标用户 {target_user_id}"
             )
 
-            # 0. 仿生睡眠检查：睡着时不主动发言
+            # 0. 仿生睡眠适配
             if _is_sleeping():
-                logger.info("[TactileActive] 小克正在睡觉，跳过主动触发（触觉仍增加清醒度）")
-                return
+                sleep_mgr = _get_sleep_manager()
+                if sleep_mgr is not None:
+                    session_id = f"private_{target_user_id}"
+                    # 推一次清醒度
+                    new_val, _ = sleep_mgr.add_wake_value(session_id)
+                    # 用 is_woken() 判断是否已过阈值（不依赖 just_woken 的一次性标志）
+                    if sleep_mgr.is_woken(session_id):
+                        logger.info(f"[TactileActive] 触觉摸醒了小克! 清醒度={new_val:.1f} → 继续执行主动触发")
+                    else:
+                        logger.debug(f"[TactileActive] 小克还在睡，清醒度={new_val:.1f}，继续积累...")
+                        return
+                else:
+                    logger.info("[TactileActive] 小克正在睡觉且无睡眠管理器，跳过")
+                    return
 
             # 1. 确保 ChatStream 存在
             chat_manager = get_chat_manager()
@@ -496,7 +518,7 @@ def _make_wakeup_callback(target_user_id: str):
                     extra_context=extra_context,
                 )
 
-            logger.info(f"[TactileActive] planner 思考: {plan_response.thought[:120]}...")
+            logger.debug(f"[TactileActive] planner 思考: {plan_response.thought[:120]}...")
             logger.info(f"[TactileActive] planner 决策: {[a.type for a in plan_response.actions]}")
 
             # 7. 检查是否决定不回应
@@ -506,7 +528,7 @@ def _make_wakeup_callback(target_user_id: str):
                     and plan_response.actions[0].type == "do_nothing")
             )
             if is_do_nothing:
-                logger.info("[TactileActive] planner 决定不回应，跳过")
+                logger.debug("[TactileActive] planner 决定不回应，跳过")
                 session.last_proactive_at = _time.time()
                 await session_manager.save_session(session.user_id)
                 return
@@ -536,7 +558,7 @@ def _make_wakeup_callback(target_user_id: str):
                 )
                 if result.get("success") and action.type in ("kfc_reply", "respond"):
                     reply_text = (result.get("reply_text") or "").strip()
-                    logger.info(f"[TactileActive] 回复已发送: {reply_text[:80]}...")
+                    logger.debug(f"[TactileActive] 回复已发送: {reply_text[:80]}...")
 
             # 10. 更新 session（不进入 WAITING — 触觉回应不期待用户回复）
             session.add_bot_planning(
@@ -547,6 +569,7 @@ def _make_wakeup_callback(target_user_id: str):
             )
             session.last_proactive_at = _time.time()
             await session_manager.save_session(session.user_id)
+
             logger.info("[TactileActive] 触觉主动触发流程完成")
 
         except Exception as e:
