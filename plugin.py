@@ -1,4 +1,4 @@
-"""触觉感知系统插件 - 通过数位板为小克提供触觉感知能力"""
+"""触觉感知系统插件 - 通过数位板为Bot提供触觉感知能力"""
 
 from __future__ import annotations
 
@@ -318,7 +318,7 @@ def _get_sleep_manager():
 
 
 def _is_sleeping() -> bool:
-    """检查小克是否在睡觉"""
+    """检查Bot是否在睡觉"""
     manager = _get_sleep_manager()
     if manager is None:
         return False
@@ -356,7 +356,7 @@ def _make_stroke_memory_callback(target_user_id: str):
                         if not sleep_mgr.is_woken(session_id):
                             new_val, just_woken = sleep_mgr.add_wake_value(session_id)
                             if just_woken:
-                                logger.info(f"[TactileSleep] 触觉唤醒了小克! 清醒度={new_val:.1f} (超过阈值)")
+                                logger.info(f"[TactileSleep] 触觉唤醒了Bot! 清醒度={new_val:.1f} (超过阈值)")
                             else:
                                 logger.debug(f"[TactileSleep] 清醒度 +increment → {new_val:.1f}")
                     except Exception as e:
@@ -427,12 +427,12 @@ def _make_wakeup_callback(target_user_id: str):
                     new_val, _ = sleep_mgr.add_wake_value(session_id)
                     # 用 is_woken() 判断是否已过阈值（不依赖 just_woken 的一次性标志）
                     if sleep_mgr.is_woken(session_id):
-                        logger.info(f"[TactileActive] 触觉摸醒了小克! 清醒度={new_val:.1f} → 继续执行主动触发")
+                        logger.info(f"[TactileActive] 触觉摸醒了Bot! 清醒度={new_val:.1f} → 继续执行主动触发")
                     else:
-                        logger.debug(f"[TactileActive] 小克还在睡，清醒度={new_val:.1f}，继续积累...")
+                        logger.debug(f"[TactileActive] Bot还在睡，清醒度={new_val:.1f}，继续积累...")
                         return
                 else:
-                    logger.info("[TactileActive] 小克正在睡觉且无睡眠管理器，跳过")
+                    logger.info("[TactileActive] Bot正在睡觉且无睡眠管理器，跳过")
                     return
 
             # 1. 确保 ChatStream 存在
@@ -585,7 +585,7 @@ def _make_wakeup_callback(target_user_id: str):
 
 @register_plugin
 class TactileSensePlugin(BasePlugin):
-    """触觉感知系统 - 通过数位板为小克提供触觉感知能力"""
+    """触觉感知系统 - 通过数位板为Bot提供触觉感知能力"""
 
     plugin_name: str = "tactile_sense"
     enable_plugin: bool = True

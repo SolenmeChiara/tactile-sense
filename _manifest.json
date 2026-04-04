@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "触觉感知系统 (Tactile Sense)",
   "version": "0.1.0",
-  "description": "通过数位板为小克提供触觉感知能力。网页前端捕获笔触信号，后端解析为触觉体验并注入认知循环。仅限本地部署者使用。",
+  "description": "通过数位板为Bot提供触觉感知能力。网页前端捕获笔触信号，后端解析为触觉体验并注入认知循环。仅限本地部署者使用。",
   "author": "sol",
   "plugin_info": {
     "is_built_in": false,
