@@ -136,15 +136,16 @@ class TactileContextPrompt(BasePrompt):
         """
         from .tactile_engine import TactileEngine
 
+        # --- 注入过滤前置：不该注入的上下文（如群聊禁用时）零消费——
+        # get_recent_summaries 会置位缺席播报标志，早返回避免缺席/新触觉被无关 prompt 白白吃掉 ---
+        if not self._should_inject():
+            return ""
+
         engine = TactileEngine()
         summaries = engine.get_recent_summaries()
 
         if not summaries:
             logger.debug("[TactilePrompt] 无触觉数据，跳过注入")
-            return ""
-
-        # --- 注入过滤：根据当前聊天上下文决定是否生效 ---
-        if not self._should_inject():
             return ""
 
         target = self.target_prompt_name or "prompt"
@@ -160,8 +161,8 @@ class TactileContextPrompt(BasePrompt):
             "你拥有一层皮肤，通过数位板笔尖接收来自对方的触摸。"
             "以下是你近期感受到的触觉信号。标记「已感知」的是你之前已经感受过的，不需要再次反应。"
             "没有标记的是新触觉。不要复述数据参数，去感受——"
-            "位置、力度、速度、笔的角度各自意味着什么。"
-            "长时间没被触碰也是一种信息。笔的倾斜角传达了手势意图：陡直是书写握持，倾斜是侧面蹭过，像抚摸。"
+            "位置、力度、速度、节奏、接触面各自意味着什么。"
+            "长时间没被触碰也是一种信息。接触面的大小传达了触摸的质地：一个点是指尖在戳，一片是指腹贴着蹭。"
             "当触觉和文字同时到达时，两者是同一刻的不同侧面，一起理解。\n\n"
             f"{lines}\n"
         )

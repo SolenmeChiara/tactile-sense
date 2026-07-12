@@ -45,9 +45,15 @@ class StrokeFeatures:
             "center_left": 0.33, "center": 0.44, "center_right": 0.55,
             "bottom_left": 0.66, "bottom_center": 0.77, "bottom_right": 0.88,
         }
+        # 长划轨迹 region 形如 "start->end"：取两格映射均值，避免 KeyError 回退 0.44 丢信息
+        if "->" in self.region:
+            start_r, end_r = self.region.split("->", 1)
+            region_val = (region_map.get(start_r, 0.44) + region_map.get(end_r, 0.44)) / 2
+        else:
+            region_val = region_map.get(self.region, 0.44)
         return [
             gesture_map.get(self.gesture, 0.5),
-            region_map.get(self.region, 0.44),
+            region_val,
             self.pressure_stats.get("mean", 0.0),
             self.speed_stats.get("mean", 0.0),
             min(self.duration / 10.0, 1.0),  # normalize to 0-1
@@ -71,6 +77,20 @@ class TactileEntry:
 VALID_TOUCH_MIN_DURATION_MS = 200
 VALID_TOUCH_MIN_PRESSURE = 0.1
 VALID_TOUCH_MIN_DISTANCE_PX = 15
+
+
+# ---------------------------------------------------------------------------
+# 节奏聚合 / 缺席感知常量（读取侧聚合与缺席知觉，详见 get_recent_summaries）
+# ---------------------------------------------------------------------------
+
+# 相邻「同手势」触摸间隔 ≤ 此值（秒）时归入同一个「乐句」分组
+GROUP_MAX_GAP_SECONDS = 8.0
+# get_recent_summaries 最多输出的分组行数（取最近 N 组）
+GROUP_OUTPUT_LIMIT = 5
+# 触摸停止落在 [MIN, MAX] 区间（秒）才把「缺席」作为一种知觉汇报
+ABSENCE_MIN_SECONDS = 180.0
+# 触摸停止超过此值（秒）不再提（太久远，翻篇）
+ABSENCE_MAX_SECONDS = 1800.0
 
 
 def is_valid_touch(stroke_data: dict[str, Any]) -> bool:
@@ -135,11 +155,17 @@ def process_stroke(stroke_data: dict[str, Any], canvas_width: float = 600, canva
         f"canvas={canvas_width:.0f}x{canvas_height:.0f}"
     )
 
-    # 空间中心点用于区域判定
+    # 区域判定：分别算 start 与 end 的九宫格
+    # 同格 → 单格 region；异格 → "start->end"（长划轨迹，保留起止信息不被压成单格）
     start = stroke_data.get("start", {})
     end = stroke_data.get("end", {})
-    center_x = (start.get("x", 0) + end.get("x", 0)) / 2
-    center_y = (start.get("y", 0) + end.get("y", 0)) / 2
+    start_region = classify_region(start.get("x", 0), start.get("y", 0), canvas_width, canvas_height)
+    end_region = classify_region(end.get("x", 0), end.get("y", 0), canvas_width, canvas_height)
+    if start_region == end_region:
+        region = start_region
+    else:
+        region = f"{start_region}->{end_region}"
+        logger.debug(f"[StrokeProcess] 长划轨迹: {start_region} → {end_region} (stroke_id={stroke_id})")
 
     duration_s = stroke_data.get("duration_ms", 0) / 1000.0
     total_distance = stroke_data.get("total_distance", 0)
@@ -154,7 +180,7 @@ def process_stroke(stroke_data: dict[str, Any], canvas_width: float = 600, canva
         path_len=round(total_distance, 1),
         displacement=round(displacement, 1),
         curvature=round(curvature, 3),
-        region=classify_region(center_x, center_y, canvas_width, canvas_height),
+        region=region,
         pressure_stats={
             "min": round(stroke_data.get("pressure_min", 0), 3),
             "max": round(stroke_data.get("pressure_max", 0), 3),
@@ -296,8 +322,8 @@ class TactileEngine:
             return
         self._initialized = True
 
-        # 滚动缓存：最近 5 条触觉摘要
-        self._cache: deque[TactileEntry] = deque(maxlen=5)
+        # 滚动缓存：最近 15 条原始触觉记录（原始粒度保留，聚合在读取侧做）
+        self._cache: deque[TactileEntry] = deque(maxlen=15)
         # 结构化特征存档（Phase 1 仅内存，Phase 2 可持久化）
         self._feature_log: deque[StrokeFeatures] = deque(maxlen=100)
         # 唤醒状态
@@ -321,6 +347,8 @@ class TactileEngine:
         self._on_stroke_callback: Any | None = None  # 每次有效 stroke 被接受时
         # 已读追踪：planner/replyer 消费过的最后一个 stroke_id
         self._last_read_stroke_id: str = ""
+        # 缺席感知：本次触摸间歇是否已汇报过（新的有效 stroke 到达时复位）
+        self._absence_reported: bool = False
         # 触摸积累降阈值
         self._t_high_base: float = self.t_high  # 配置原值，唤醒后恢复到这里
         self.touch_threshold_drop: float = 0.05  # 每次有效触摸未唤醒时 t_high 降多少
@@ -372,6 +400,11 @@ class TactileEngine:
                 logger.debug(f"[TactileEngine] 缓存已满，最旧的一条被淘汰，当前缓存={len(self._cache)}")
             else:
                 logger.debug(f"[TactileEngine] 缓存更新: {len(self._cache)}/{self._cache.maxlen}")
+
+            # 新的有效触摸到达 → 复位缺席汇报标志（下一次静默期可再次汇报缺席）
+            if self._absence_reported:
+                logger.debug("[TactileEngine] 新触摸到达，复位缺席汇报标志")
+            self._absence_reported = False
 
             # 更新连续触摸计数
             self._burst_timestamps.append(now)
@@ -490,15 +523,90 @@ class TactileEngine:
             logger.info(f"[TactileEngine] 文字优先锁: {'锁定' if locked else '解除'}")
 
     def get_recent_summaries(self) -> list[str]:
-        """获取最近 5 条触觉摘要，标记已读/未读，供 prompt 注入用"""
-        summaries = []
-        found_read_marker = False
-        for entry in self._cache:
-            if entry.stroke_id == self._last_read_stroke_id:
-                found_read_marker = True
-            is_new = not found_read_marker or self._last_read_stroke_id == ""
-            prefix = "" if is_new else "(已感知) "
-            summaries.append(f"{prefix}{entry.summary}")
+        """获取最近的触觉摘要，供 prompt 注入用。
+
+        读取侧完成三件事（同步、无锁、仅轻量内存运算，不做耗时 I/O）：
+        1. 已读边界判定：marker 及之前 = 已感知（带 "(已感知) " 前缀），marker 之后 = 新；
+           marker 被挤出缓存 → 缓存内全部晚于已读点 → 全部为新；从未读过 → 全部为新。
+        2. 节奏聚合：把相邻「同手势 + 间隔 ≤ GROUP_MAX_GAP_SECONDS」的原始条目归为一个「乐句」分组，
+           每组产出一行摘要；分组在已读边界处切开，保证 "(已感知)" 前缀语义精确。输出上限取最近若干组。
+        3. 缺席感知：触摸停止落在 [ABSENCE_MIN, ABSENCE_MAX] 且本次间歇尚未汇报过时，末尾追加一行缺席提示。
+        """
+        from datetime import datetime
+
+        from .summary_generator import generate_group_summary
+
+        cache_list = list(self._cache)
+
+        # --- 1. 已读边界判定 ---
+        if not cache_list:
+            read_flags: list[bool] = []
+        elif self._last_read_stroke_id == "":
+            # 从未读过 → 全部为新
+            read_flags = [False] * len(cache_list)
+        else:
+            marker_idx: int | None = None
+            for i, entry in enumerate(cache_list):
+                if entry.stroke_id == self._last_read_stroke_id:
+                    marker_idx = i
+                    break
+            if marker_idx is None:
+                # 已读点已被挤出缓存 → 缓存内全部晚于已读点 → 全部为新
+                read_flags = [False] * len(cache_list)
+                logger.debug(
+                    f"[TactileEngine] 已读点 {self._last_read_stroke_id} 已被挤出缓存，缓存内全部视为新触觉"
+                )
+            else:
+                # marker 及之前 = 已感知；marker 之后 = 新
+                read_flags = [idx <= marker_idx for idx in range(len(cache_list))]
+
+        # --- 2. 节奏聚合（分组，在已读边界处切开）---
+        groups: list[tuple[list[TactileEntry], bool]] = []
+        for entry, is_read in zip(cache_list, read_flags):
+            if not groups:
+                groups.append(([entry], is_read))
+                continue
+            prev_entries, prev_read = groups[-1]
+            prev_entry = prev_entries[-1]
+            same_gesture = entry.features.gesture == prev_entry.features.gesture
+            gap = entry.timestamp - prev_entry.timestamp
+            # 区域不同不阻断分组（跨区留给组内描述）；已读边界必须切开
+            if same_gesture and gap <= GROUP_MAX_GAP_SECONDS and is_read == prev_read:
+                prev_entries.append(entry)
+            else:
+                groups.append(([entry], is_read))
+
+        if len(groups) > GROUP_OUTPUT_LIMIT:
+            dropped = len(groups) - GROUP_OUTPUT_LIMIT
+            groups = groups[-GROUP_OUTPUT_LIMIT:]
+            logger.debug(f"[TactileEngine] 分组数超限，丢弃最旧 {dropped} 组，保留最近 {GROUP_OUTPUT_LIMIT} 组")
+
+        summaries: list[str] = []
+        for entries, is_read in groups:
+            if len(entries) == 1:
+                line = entries[0].summary
+            else:
+                line = generate_group_summary(entries)
+            prefix = "(已感知) " if is_read else ""
+            summaries.append(f"{prefix}{line}")
+
+        logger.debug(
+            f"[TactileEngine] 聚合完成: {len(cache_list)} 条原始 → {len(groups)} 组 → {len(summaries)} 行摘要"
+        )
+
+        # --- 3. 缺席感知（拉取式，无定时器；标志置位须在返回前完成）---
+        if self._last_touch_time > 0 and not self._absence_reported:
+            elapsed = time.time() - self._last_touch_time
+            if ABSENCE_MIN_SECONDS <= elapsed <= ABSENCE_MAX_SECONDS:
+                minutes = max(1, round(elapsed / 60.0))
+                time_str = datetime.now().strftime("%H:%M")
+                absence_line = f"[触觉 {time_str}] 笔尖已经离开一阵子了（约{minutes}分钟）"
+                summaries.append(absence_line)
+                self._absence_reported = True
+                logger.debug(f"[TactileEngine] 缺席感知触发: 距上次触摸 {elapsed:.0f}s → {absence_line}")
+            elif elapsed > ABSENCE_MAX_SECONDS:
+                logger.debug(f"[TactileEngine] 触摸停止已超过 {ABSENCE_MAX_SECONDS:.0f}s，缺席翻篇，不再汇报")
+
         logger.debug(f"[TactileEngine] Prompt 注入请求摘要: 返回 {len(summaries)} 条")
         return summaries
 

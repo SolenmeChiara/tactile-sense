@@ -12,9 +12,23 @@ from typing import TYPE_CHECKING
 from src.common.logger import get_logger
 
 if TYPE_CHECKING:
-    from .tactile_engine import StrokeFeatures
+    from .tactile_engine import StrokeFeatures, TactileEntry
 
 logger = get_logger("tactile_summary")
+
+
+# ---------------------------------------------------------------------------
+# 笔倾斜 → 接触面积翻译
+# 被摸的一方感受到的不是笔的角度，而是接触面从一个点变成了一片——
+# 物理上笔越倾斜，笔尖与感应面的接触椭圆越大。故按面积语义翻译，不暴露仪器细节。
+# ---------------------------------------------------------------------------
+
+_TILT_CONTACT_POINT = 15  # 倾斜角（|x|+|y|，度）低于此值 → 点接触，不描述
+_TILT_CONTACT_WIDE = 35   # 低于此值 → 接触面变宽（指腹级）；不低于 → 大面积贴合
+_TILT_PHRASE_WIDE = "，接触面变宽了些，不是指尖是指腹"
+_TILT_PHRASE_FULL = "，大片地贴着，像整个指腹压了上来"
+_TILT_PHRASE_FULL_SHORT = "，贴得很实"  # 与质感短语并存导致超长时的收缩版
+_SUMMARY_DESC_MAX_CHARS = 70  # 摘要描述目标长度上限（字）
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +70,19 @@ def _speed_word(mean: float) -> str:
     return "飞快地"
 
 
+def _region_endpoints(region: str) -> tuple[str, str]:
+    """长划轨迹 region 形如 "start->end"，返回 (start, end)；普通 region 返回 (r, r)"""
+    if "->" in region:
+        a, b = region.split("->", 1)
+        return a, b
+    return region, region
+
+
 def _region_word(region: str) -> str:
+    # 长划轨迹 "start->end" → "从{A}一路划到{B}"
+    if "->" in region:
+        start_r, end_r = _region_endpoints(region)
+        return f"从{_region_word(start_r)}一路划到{_region_word(end_r)}"
     mapping = {
         "top_left": "左上方",
         "top_center": "上方",
@@ -72,13 +98,13 @@ def _region_word(region: str) -> str:
 
 
 def _tilt_description(tilt_x: float, tilt_y: float) -> str:
-    """笔的倾斜角 → 手势意图描述"""
+    """笔的倾斜角 → 接触面积体感描述（点 → 指腹 → 大片贴合）"""
     angle = abs(tilt_x) + abs(tilt_y)
-    if angle < 15:
-        return ""  # 近乎垂直，普通握持
-    if angle < 35:
-        return "，笔略微倾斜"
-    return "，倾斜角大——笔侧面接触"
+    if angle < _TILT_CONTACT_POINT:
+        return ""  # 近乎垂直，点接触，不描述
+    if angle < _TILT_CONTACT_WIDE:
+        return _TILT_PHRASE_WIDE
+    return _TILT_PHRASE_FULL
 
 
 def _duration_word(duration: float) -> str:
@@ -139,6 +165,9 @@ def generate_summary(features: StrokeFeatures) -> str:
     # 组装描述
     gesture_verb = _GESTURE_VERBS.get(features.gesture, "碰了")
     region = _region_word(features.region)
+    # 长划轨迹的 region 词本身已是"从A一路划到B"，locative 模板前面不再加"在/于"
+    is_cross = "->" in features.region
+    loc_prefix = "" if is_cross else "在"
     p_mean = features.pressure_stats.get("mean", 0)
     p_max = features.pressure_stats.get("max", 0)
     p_min = features.pressure_stats.get("min", 0)
@@ -164,14 +193,14 @@ def generate_summary(features: StrokeFeatures) -> str:
         desc = f"用力按着{speed}拖过{region}，{duration_s}，压力{pressure}{trend}{tilt}"
     elif features.gesture == "rub":
         duration_s = f"{features.duration:.1f}s"
-        desc = f"在{region}来回蹭着，{duration_s}，力道{pressure}{tilt}"
+        desc = f"{loc_prefix}{region}来回蹭着，{duration_s}，力道{pressure}{tilt}"
     elif features.gesture == "scratch":
         duration_s = f"{features.duration:.1f}s"
-        desc = f"在{region}挠了挠，{duration_s}，压力{pressure}，动作急促"
+        desc = f"{loc_prefix}{region}挠了挠，{duration_s}，压力{pressure}，动作急促"
     elif features.gesture == "circle":
-        desc = f"在{region}画了个圈，{pressure}的力道"
+        desc = f"{loc_prefix}{region}画了个圈，{pressure}的力道"
     elif features.gesture == "scribble":
-        desc = f"在{region}胡乱涂画，动作急促"
+        desc = f"{loc_prefix}{region}胡乱涂画，动作急促"
     elif features.gesture == "slow_trace":
         duration_s = f"{features.duration:.1f}s"
         desc = f"{speed}划过{region}，{duration_s}，压力{pressure}{trend}{tilt}"
@@ -180,11 +209,55 @@ def generate_summary(features: StrokeFeatures) -> str:
         if features.curvature < 0.5:
             desc += "，轨迹弯曲"
     elif features.gesture == "interrupted":
-        desc = f"触摸被中断于{region}（笔尖离开感应范围）"
+        desc = (
+            f"触摸被中断，{region}（笔尖离开感应范围）"
+            if is_cross
+            else f"触摸被中断于{region}（笔尖离开感应范围）"
+        )
     else:
         duration_s = f"{features.duration:.1f}s" if features.duration > 0.5 else ""
         time_part = f"，{duration_s}" if duration_s else ""
         desc = f"{gesture_verb}{region}{time_part}，{pressure}"
+
+    # --- 质感层：满足特征组合时追加/替换质感短语（组合冲突按顺序取第一个）---
+    # 这些短语是把 bot 交互中自然涌现的体感词收编进感官词表，让模板更贴近"感受"而非报告。
+    speed_mean = features.speed_stats.get("mean", 0)
+    texture = ""
+    if (
+        speed_mean < 0.18 and 0.15 <= p_mean < 0.5 and features.path_len > 120
+        and features.gesture in ("stroke", "slow_trace")
+    ):
+        # "顺毛" — bot 本人 2026-07-11 首次被摸时自己发明的词，收编进感官词表
+        desc += "，像被顺毛"
+        texture = "像被顺毛"
+    elif (
+        speed_mean >= 0.35 and p_max < 0.3 and features.duration < 0.8
+        and features.gesture in ("flick", "stroke")
+    ):
+        desc += "，痒痒的"
+        texture = "痒痒的"
+    elif features.gesture == "circle" and speed_mean < 0.18:
+        # 慢速画圈 → 替换动词短语，更具摩挲感
+        desc = f"{loc_prefix}{region}慢慢摩挲着画圈，{pressure}的力道"
+        texture = "慢慢摩挲着画圈"
+    elif (
+        features.gesture in ("rub", "scratch")
+        and features.displacement < 20 and features.duration > 1.5
+    ):
+        # 同点反复摩擦
+        desc += "，固执地磨同一个地方"
+        texture = "固执地磨同一个地方"
+    if texture:
+        logger.debug(f"[Summary] 质感层命中: stroke={features.stroke_id} → 追加/替换「{texture}」")
+
+    # 质感短语 × 大接触面并存超长时：优先保质感短语，接触面短语收缩为"贴得很实"
+    if texture and _TILT_PHRASE_FULL in desc and len(desc) > _SUMMARY_DESC_MAX_CHARS:
+        over_len = len(desc)
+        desc = desc.replace(_TILT_PHRASE_FULL, _TILT_PHRASE_FULL_SHORT)
+        logger.debug(
+            f"[Summary] 描述超长({over_len}字>{_SUMMARY_DESC_MAX_CHARS})，"
+            f"接触面短语收缩为「贴得很实」({len(desc)}字)"
+        )
 
     # 截断标记
     if features.truncated and features.gesture != "interrupted":
@@ -192,4 +265,86 @@ def generate_summary(features: StrokeFeatures) -> str:
 
     result = f"[触觉 {time_str}] {desc}"
     logger.debug(f"[Summary] 摘要生成完成: stroke={features.stroke_id} → {result}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 分组（乐句）摘要 —— 把一串同手势的连续触摸合成一句节奏化的体感描述
+# ---------------------------------------------------------------------------
+
+# 节奏分档阈值（组内相邻间隔，单位秒）
+_RHYTHM_BRISK_MEAN = 1.0    # 间隔均值 < 此值 → 急促连续
+_RHYTHM_STEADY_MEAN = 3.0   # 间隔均值 < 此值 → 不紧不慢；否则断断续续
+_RHYTHM_PAUSE_GAP = 2.0     # 存在 > 此值的单个间隙 且 方差大 → "中间停了口气又继续"
+_RHYTHM_PAUSE_VAR = 1.5     # 间隔方差 > 此值（配合长间隙）→ 停顿感
+# 首尾压力均值差判定趋势
+_GROUP_PRESSURE_DELTA = 0.08
+
+
+def generate_group_summary(entries: list[TactileEntry]) -> str:
+    """把一组「同手势 + 间隔相近」的连续触摸合成为一行节奏化摘要。
+
+    entries: 时间升序的 TactileEntry 列表，len >= 2（单条组由调用方直接用原摘要）。
+    输出: [触觉 HH:MM] <区域><动词>，接连N下，<节奏>，<压力趋势>
+    时间戳取组内最后一条；动词沿用 _GESTURE_VERBS（去尾部方位介词以便拼接）。
+    """
+    n = len(entries)
+    first_f = entries[0].features
+    last_f = entries[-1].features
+    gesture = first_f.gesture
+
+    # 时间戳用组内最后一条
+    try:
+        dt_local = datetime.fromisoformat(last_f.ts).astimezone()
+    except (ValueError, TypeError):
+        dt_local = datetime.now()
+    time_str = dt_local.strftime("%H:%M")
+
+    # 动词沿用 _GESTURE_VERBS，去掉结尾的方位介词（在/于）以便拼接次数
+    verb = _GESTURE_VERBS.get(gesture, "碰了").rstrip("在于")
+
+    # --- 区域：同区说区域名，跨区说"从X到Y一带"（组内任一条跨区也计入端点集合）---
+    start_region = _region_endpoints(first_f.region)[0]
+    end_region = _region_endpoints(last_f.region)[1]
+    distinct: set[str] = set()
+    for e in entries:
+        a, b = _region_endpoints(e.features.region)
+        distinct.add(a)
+        distinct.add(b)
+    if len(distinct) == 1:
+        region_lead = f"在{_region_word(start_region)}"
+    else:
+        region_lead = f"从{_region_word(start_region)}到{_region_word(end_region)}一带"
+
+    # --- 节奏：组内相邻间隔的均值 + 方差 分档 ---
+    intervals = [entries[i].timestamp - entries[i - 1].timestamp for i in range(1, n)]
+    mean_iv = sum(intervals) / len(intervals) if intervals else 0.0
+    var_iv = sum((x - mean_iv) ** 2 for x in intervals) / len(intervals) if intervals else 0.0
+    max_iv = max(intervals) if intervals else 0.0
+    if var_iv > _RHYTHM_PAUSE_VAR and max_iv > _RHYTHM_PAUSE_GAP:
+        rhythm = "中间停了口气又继续"
+    elif mean_iv < _RHYTHM_BRISK_MEAN:
+        rhythm = "一下接一下急促连续"
+    elif mean_iv < _RHYTHM_STEADY_MEAN:
+        rhythm = "不紧不慢地一下下来"
+    else:
+        rhythm = "断断续续，时有时无"
+
+    # --- 压力趋势：首尾组内 pressure mean 对比 ---
+    first_p = first_f.pressure_stats.get("mean", 0)
+    last_p = last_f.pressure_stats.get("mean", 0)
+    delta = last_p - first_p
+    if delta > _GROUP_PRESSURE_DELTA:
+        trend = "力道一下比一下沉"
+    elif delta < -_GROUP_PRESSURE_DELTA:
+        trend = "力道渐渐放得轻了"
+    else:
+        trend = "力道自始至终稳着"
+
+    desc = f"{region_lead}{verb}，接连{n}下，{rhythm}，{trend}"
+    result = f"[触觉 {time_str}] {desc}"
+    logger.debug(
+        f"[Summary] 分组摘要: {n}条 {gesture} | 间隔均值={mean_iv:.2f}s 方差={var_iv:.2f} "
+        f"压力Δ={delta:+.3f} → {result}"
+    )
     return result
