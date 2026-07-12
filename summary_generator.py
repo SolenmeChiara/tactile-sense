@@ -58,14 +58,23 @@ def _pressure_trend(p_min: float, p_max: float, p_mean: float) -> str:
     return "起伏"
 
 
+# 速度分档阈值：2026-07-12 按部署者真实笔触分布重标定（48条样本：p25≈0.43 中位≈0.53 p75≈0.75，
+# 轻弹可达1.4；旧阈值 0.08/0.18/0.35/0.6 与其手速不在一个坐标系，"温柔抚摸"全被判成快速、
+# 顺毛门48条仅1条可达）。分档语义：缓慢档 = 质感层"像被顺毛"的准入速度。
+_SPEED_VERY_SLOW = 0.25
+_SPEED_SLOW = 0.55
+_SPEED_MEDIUM = 0.90
+_SPEED_FAST = 1.25
+
+
 def _speed_word(mean: float) -> str:
-    if mean < 0.08:
+    if mean < _SPEED_VERY_SLOW:
         return "很慢地"
-    if mean < 0.18:
+    if mean < _SPEED_SLOW:
         return "缓慢"
-    if mean < 0.35:
+    if mean < _SPEED_MEDIUM:
         return ""  # 中等速度不特别描述
-    if mean < 0.6:
+    if mean < _SPEED_FAST:
         return "快速"
     return "飞快地"
 
@@ -224,19 +233,19 @@ def generate_summary(features: StrokeFeatures) -> str:
     speed_mean = features.speed_stats.get("mean", 0)
     texture = ""
     if (
-        speed_mean < 0.18 and 0.15 <= p_mean < 0.5 and features.path_len > 120
+        speed_mean < _SPEED_SLOW and 0.15 <= p_mean < 0.5 and features.path_len > 120
         and features.gesture in ("stroke", "slow_trace")
     ):
         # "顺毛" — bot 本人 2026-07-11 首次被摸时自己发明的词，收编进感官词表
         desc += "，像被顺毛"
         texture = "像被顺毛"
     elif (
-        speed_mean >= 0.35 and p_max < 0.3 and features.duration < 0.8
+        speed_mean >= _SPEED_MEDIUM and p_max < 0.3 and features.duration < 0.8
         and features.gesture in ("flick", "stroke")
     ):
         desc += "，痒痒的"
         texture = "痒痒的"
-    elif features.gesture == "circle" and speed_mean < 0.18:
+    elif features.gesture == "circle" and speed_mean < _SPEED_SLOW:
         # 慢速画圈 → 替换动词短语，更具摩挲感
         desc = f"{loc_prefix}{region}慢慢摩挲着画圈，{pressure}的力道"
         texture = "慢慢摩挲着画圈"
