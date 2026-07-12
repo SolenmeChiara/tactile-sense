@@ -93,6 +93,17 @@ ABSENCE_MIN_SECONDS = 180.0
 ABSENCE_MAX_SECONDS = 1800.0
 
 
+# ---------------------------------------------------------------------------
+# 回合快照常量（Fix A：同一回合内多次 prompt 构建复用同一份触觉内容）
+# ---------------------------------------------------------------------------
+
+# 快照存活时长（秒）：TTL 内的所有 prompt 构建复用同一快照，保证回合内一致
+SNAPSHOT_TTL_SECONDS = 90.0
+# 有新 stroke 时，距快照创建至少经过此值（秒）才换新快照——
+# 既让同一回合的 planner+replyer 复用同一份内容，又把新触摸被隐藏的时长限制在约一个回合内
+SNAPSHOT_MIN_REFRESH_SECONDS = 10.0
+
+
 def is_valid_touch(stroke_data: dict[str, Any]) -> bool:
     """三选二判定：持续时间 > 200ms、压力峰值 > 0.1、移动距离 > 15px"""
     criteria_met = 0
@@ -303,6 +314,24 @@ def compute_wakeup_score(
 
 
 # ---------------------------------------------------------------------------
+# 回合快照
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TactileSnapshot:
+    """一轮注入的触觉快照。
+
+    TTL 内的多次 prompt 构建（planner + replyer + 主动触发并行等）复用同一份内容，
+    保证同一回合看到完全一致的触觉切片；换新快照时据 last_stroke_id 推进已读指针。
+    """
+
+    summaries: list[str]  # 注入用的最终摘要行（含"(已感知)"前缀 / 缺席行）
+    created_at: float  # 快照创建时刻 (unix)
+    last_stroke_id: str  # 创建时缓存末条 stroke_id（""=空缓存）；换新时据此推进已读指针
+    stroke_count: int  # 创建时的累计有效 stroke 计数，用于判定"有无新 stroke"
+
+
+# ---------------------------------------------------------------------------
 # 触觉引擎主类
 # ---------------------------------------------------------------------------
 
@@ -349,6 +378,10 @@ class TactileEngine:
         self._last_read_stroke_id: str = ""
         # 缺席感知：本次触摸间歇是否已汇报过（新的有效 stroke 到达时复位）
         self._absence_reported: bool = False
+        # 回合快照（Fix A）：TTL 内多次 prompt 构建复用同一份内容，换新时才推进已读
+        self._snapshot: _TactileSnapshot | None = None
+        # 累计有效 stroke 计数：单调递增，供快照判定"距上次快照是否有新 stroke"
+        self._stroke_counter: int = 0
         # 触摸积累降阈值
         self._t_high_base: float = self.t_high  # 配置原值，唤醒后恢复到这里
         self.touch_threshold_drop: float = 0.05  # 每次有效触摸未唤醒时 t_high 降多少
@@ -400,6 +433,9 @@ class TactileEngine:
                 logger.debug(f"[TactileEngine] 缓存已满，最旧的一条被淘汰，当前缓存={len(self._cache)}")
             else:
                 logger.debug(f"[TactileEngine] 缓存更新: {len(self._cache)}/{self._cache.maxlen}")
+
+            # 累计有效 stroke 计数（供回合快照判定"距上次快照是否有新 stroke"）
+            self._stroke_counter += 1
 
             # 新的有效触摸到达 → 复位缺席汇报标志（下一次静默期可再次汇报缺席）
             if self._absence_reported:
@@ -523,7 +559,63 @@ class TactileEngine:
             logger.info(f"[TactileEngine] 文字优先锁: {'锁定' if locked else '解除'}")
 
     def get_recent_summaries(self) -> list[str]:
-        """获取最近的触觉摘要，供 prompt 注入用。
+        """获取用于 prompt 注入的触觉摘要（回合快照语义，Fix A）。
+
+        首次注入创建快照（内容 + 时间戳 + 缓存末条 id + stroke 计数）；TTL（SNAPSHOT_TTL_SECONDS）
+        内的后续构建复用同一快照——保证同一回合的多次 prompt 构建（planner + replyer + 主动触发并行等）
+        看到完全一致的触觉内容。快照过期，或「有新 stroke 且距快照创建 ≥ SNAPSHOT_MIN_REFRESH_SECONDS」
+        时换新快照；换新的那一刻才把旧快照末条 id 推进为已读指针（"上一轮已随整轮注入完成 = 已感知"），
+        因此已读指针绝不会在内容随一整轮注入完成之前抢跑。
+
+        同步、无锁：本方法及 _compute_summaries 全程无 await，单次调用相对事件循环原子，
+        stroke 计数在 process_incoming_stroke 的锁内自增，无需额外加锁。
+        """
+        now = time.time()
+        snap = self._snapshot
+
+        need_new = False
+        reason = ""
+        if snap is None:
+            need_new = True
+            reason = "首次"
+        else:
+            age = now - snap.created_at
+            has_new_stroke = self._stroke_counter > snap.stroke_count
+            if age >= SNAPSHOT_TTL_SECONDS:
+                need_new = True
+                reason = f"过期(age={age:.0f}s≥{SNAPSHOT_TTL_SECONDS:.0f}s)"
+            elif has_new_stroke and age >= SNAPSHOT_MIN_REFRESH_SECONDS:
+                need_new = True
+                reason = f"新触摸(age={age:.0f}s≥{SNAPSHOT_MIN_REFRESH_SECONDS:.0f}s)"
+
+        if not need_new and snap is not None:
+            logger.debug(
+                f"[TactileEngine] 复用触觉快照 (age={now - snap.created_at:.0f}s, 行数={len(snap.summaries)})"
+            )
+            return list(snap.summaries)
+
+        # 换新快照：先把旧快照末条推进为已读（上一轮已随整轮注入完成 → 已感知）
+        if snap is not None and snap.last_stroke_id and self._last_read_stroke_id != snap.last_stroke_id:
+            prev = self._last_read_stroke_id
+            self._last_read_stroke_id = snap.last_stroke_id
+            logger.debug(
+                f"[TactileEngine] 快照换新，已读指针推进: {prev or '(无)'} → {snap.last_stroke_id}"
+            )
+
+        summaries, last_stroke_id = self._compute_summaries()
+        self._snapshot = _TactileSnapshot(
+            summaries=list(summaries),
+            created_at=now,
+            last_stroke_id=last_stroke_id,
+            stroke_count=self._stroke_counter,
+        )
+        logger.debug(
+            f"[TactileEngine] 创建触觉快照 ({reason}): 行数={len(summaries)} 末条={last_stroke_id or '(空)'}"
+        )
+        return list(summaries)
+
+    def _compute_summaries(self) -> tuple[list[str], str]:
+        """计算当前触觉摘要，返回 (摘要行列表, 缓存末条 stroke_id)。仅由 get_recent_summaries 调用。
 
         读取侧完成三件事（同步、无锁、仅轻量内存运算，不做耗时 I/O）：
         1. 已读边界判定：marker 及之前 = 已感知（带 "(已感知) " 前缀），marker 之后 = 新；
@@ -537,6 +629,7 @@ class TactileEngine:
         from .summary_generator import generate_group_summary
 
         cache_list = list(self._cache)
+        last_stroke_id = cache_list[-1].stroke_id if cache_list else ""
 
         # --- 1. 已读边界判定 ---
         if not cache_list:
@@ -607,11 +700,15 @@ class TactileEngine:
             elif elapsed > ABSENCE_MAX_SECONDS:
                 logger.debug(f"[TactileEngine] 触摸停止已超过 {ABSENCE_MAX_SECONDS:.0f}s，缺席翻篇，不再汇报")
 
-        logger.debug(f"[TactileEngine] Prompt 注入请求摘要: 返回 {len(summaries)} 条")
-        return summaries
+        logger.debug(f"[TactileEngine] 摘要计算完成: 返回 {len(summaries)} 条")
+        return summaries, last_stroke_id
 
     def mark_as_read(self) -> None:
-        """标记当前缓存中所有触觉为已读（planner/replyer 消费后调用）"""
+        """标记当前缓存中所有触觉为已读。
+
+        注意（Fix A 后）：已读推进已由 get_recent_summaries 的"换快照即推进"机制接管，
+        正常注入路径不再调用此方法。保留作为手动兜底 / 向后兼容；直接调用会绕过快照，慎用。
+        """
         if self._cache:
             self._last_read_stroke_id = self._cache[-1].stroke_id
             logger.debug(f"[TactileEngine] 标记已读到: {self._last_read_stroke_id}")

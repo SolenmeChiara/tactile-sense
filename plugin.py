@@ -153,8 +153,8 @@ class TactileContextPrompt(BasePrompt):
 
         lines = "\n".join(summaries)
 
-        # 标记为已读（下次注入时旧的会带 "(已感知)" 前缀）
-        engine.mark_as_read()
+        # 不在此处 mark_as_read：已读推进已由引擎的"回合快照"机制接管（换快照时才推进），
+        # 保证同一回合的 planner+replyer 多次构建看到一致内容、已读指针不抢跑。
 
         return (
             "\n\n## 触觉感知\n"
@@ -306,6 +306,29 @@ class TactileStartupHandler(BaseEventHandler):
         return {"success": True}
 
 
+class TactileSendActivityHandler(BaseEventHandler):
+    """订阅 AFTER_SEND，记录各聊天流最近一次发送时间，供主动触发的冷却闸（Fix B 闸2）使用。
+
+    热路径：每次消息发送都会触发，故仅做 O(1) 字典写入并全程 try/except，绝不抛出、不阻塞发送。
+    """
+
+    handler_name = "tactile_send_activity_handler"
+    handler_description = "记录各聊天流最近发送时间，供主动触发互斥闸使用"
+    init_subscribe: ClassVar[list[EventType]] = [EventType.AFTER_SEND]
+
+    async def execute(self, params: dict | None) -> Any:
+        try:
+            stream_id = params.get("stream_id") if params else None
+            if stream_id:
+                import time as _time
+
+                _last_send_time_by_stream[stream_id] = _time.time()
+                logger.debug(f"[TactileActive] 记录发送时间 stream={stream_id}")
+        except Exception as e:
+            logger.debug(f"[TactileActive] AFTER_SEND 记录异常: {e}")
+        return {"success": True}
+
+
 def _get_sleep_manager():
     """获取仿生睡眠管理器（可选依赖，没装返回 None）"""
     try:
@@ -401,6 +424,81 @@ def _make_stroke_memory_callback(target_user_id: str):
     return _on_stroke_accepted
 
 
+# ===========================================================================
+# 主动触发与主链路互斥（Fix B）
+# ===========================================================================
+
+# 各聊天流最近一次"发送"时间戳（由 TactileSendActivityHandler 订阅 AFTER_SEND 记录）。
+# 覆盖主链路回复与主动触发回复（二者走同一发送路径），用于闸2冷却判定。
+_last_send_time_by_stream: dict[str, float] = {}
+# 最近一次主动触发放行的时间戳（全局频率兜底，闸3）。
+_last_active_trigger_time: float = 0.0
+
+# 主动触发自身两次之间的最小间隔（秒，闸3全局兜底）
+ACTIVE_TRIGGER_MIN_INTERVAL: float = 60.0
+# 距该 stream 最近一次发送不足此值（秒）则跳过主动触发（闸2冷却）
+ACTIVE_TRIGGER_STREAM_COOLDOWN: float = 30.0
+
+
+async def _active_trigger_gates_pass(target_user_id: str) -> bool:
+    """主动触发三道互斥闸：全部放行返回 True，任一命中返回 False。
+
+    失败隔离：任一闸的检查抛异常都放行（回退旧行为，不因互斥逻辑本身故障而吞掉回应）。
+    闸序：先廉价的全局频率兜底（并同步抢占窗口防并行重复），再查主链路状态与冷却。
+    """
+    global _last_active_trigger_time
+    import time as _time
+
+    now = _time.time()
+
+    # --- 闸3：全局频率兜底（同步 set-then-check，防并行任务同时放行导致重复出稿）---
+    try:
+        since_last = now - _last_active_trigger_time
+        if since_last < ACTIVE_TRIGGER_MIN_INTERVAL:
+            logger.debug(
+                f"[TactileActive] 闸3命中：距上次主动触发 {since_last:.1f}s < "
+                f"{ACTIVE_TRIGGER_MIN_INTERVAL:.0f}s，跳过"
+            )
+            return False
+        # 抢占本次窗口：即便随后被闸1/2拦截，也保持 60s 内不再发起（避免重试刷屏）
+        _last_active_trigger_time = now
+    except Exception as e:
+        logger.debug(f"[TactileActive] 闸3检查异常，放行: {e}")
+
+    # --- 计算目标私聊 stream_id（无副作用的确定性哈希）---
+    try:
+        from src.chat.message_receive.chat_stream import ChatManager, get_chat_manager
+
+        stream_id = ChatManager.get_stream_id(platform="qq", id=target_user_id, is_group=False)
+    except Exception as e:
+        logger.debug(f"[TactileActive] 无法计算 stream_id，闸1/2放行: {e}")
+        return True
+
+    # --- 闸1：主链路正在处理该 stream（Chatter 在跑）→ 让路 ---
+    try:
+        chat_manager = get_chat_manager()
+        chat_stream = await chat_manager.get_stream(stream_id)
+        if chat_stream is not None and getattr(chat_stream.context, "is_chatter_processing", False):
+            logger.debug(f"[TactileActive] 闸1命中：主链路正在处理 stream={stream_id}，跳过")
+            return False
+    except Exception as e:
+        logger.debug(f"[TactileActive] 闸1检查异常，放行: {e}")
+
+    # --- 闸2：距该 stream 最近一次发送不足冷却窗口 → 跳过（主链路刚回过话）---
+    try:
+        last_send = _last_send_time_by_stream.get(stream_id, 0.0)
+        if last_send > 0 and (now - last_send) < ACTIVE_TRIGGER_STREAM_COOLDOWN:
+            logger.debug(
+                f"[TactileActive] 闸2命中：距上次发送 {now - last_send:.1f}s < "
+                f"{ACTIVE_TRIGGER_STREAM_COOLDOWN:.0f}s，跳过"
+            )
+            return False
+    except Exception as e:
+        logger.debug(f"[TactileActive] 闸2检查异常，放行: {e}")
+
+    return True
+
+
 def _make_wakeup_callback(target_user_id: str):
     """创建唤醒回调闭包，捕获 target_user_id"""
 
@@ -418,6 +516,11 @@ def _make_wakeup_callback(target_user_id: str):
             logger.info(
                 f"[TactileActive] 触觉唤醒触发! score={score:.3f} → 目标用户 {target_user_id}"
             )
+
+            # 0a. 主链路互斥三道闸（Fix B）：正在处理 / 刚回过话 / 触发过密 → 让路，避免"一条消息三条回复"
+            if not await _active_trigger_gates_pass(target_user_id):
+                logger.info("[TactileActive] 被主链路互斥闸拦截，本次主动触发跳过")
+                return
 
             # 0. 仿生睡眠适配
             if _is_sleeping():
@@ -644,12 +747,13 @@ class TactileSensePlugin(BasePlugin):
         components.append((TactileRouter.get_router_info(), TactileRouter))
         components.append((TactileContextPrompt.get_prompt_info(), TactileContextPrompt))
         components.append((TactileStartupHandler.get_handler_info(), TactileStartupHandler))
+        components.append((TactileSendActivityHandler.get_handler_info(), TactileSendActivityHandler))
         return components
 
     async def on_plugin_loaded(self):
         logger.info("[TactileSense] ====== 触觉感知系统插件已加载 ======")
         logger.info(f"[TactileSense] 版本: {self.plugin_version}")
-        logger.info(f"[TactileSense] 组件: TactileRouter, TactileContextPrompt, TactileStartupHandler")
+        logger.info(f"[TactileSense] 组件: TactileRouter, TactileContextPrompt, TactileStartupHandler, TactileSendActivityHandler")
         logger.info(f"[TactileSense] 前端路由: /plugins/tactile_sense/tactile_router/")
 
         # 注入配置摘要
